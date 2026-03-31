@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: alk-gmail-cron
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python gmail_cron.py
+    envVars:
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false

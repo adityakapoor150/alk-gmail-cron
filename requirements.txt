@@ -1,0 +1,2 @@
+supabase==2.4.6
+beautifulsoup4==4.12.3

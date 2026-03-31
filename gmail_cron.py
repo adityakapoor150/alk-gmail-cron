@@ -238,40 +238,51 @@ def run_import():
     log.info(f"✅ {len(new_rows)} rows → gsts")
 
     # Generate invoices grouped by date
+    log.info("── Starting invoice generation ────────────────────────────────")
     grouped = {}
     for r in new_rows:
         grouped.setdefault(r["sale_date"], []).append(r)
 
+    log.info(f"Dates to invoice: {sorted(grouped.keys())}")
     invoices_created = 0
+
     for date, items in sorted(grouped.items()):
-        financial_year = get_financial_year(date)
-        existing_inv = supabase.table("invoices").select("id").eq("financial_year", financial_year).execute()
-        invoice_num = len(existing_inv.data or []) + 1
-        invoice_number = f"{COMPANY_CODE}/{financial_year}/{invoice_num}"
-        grand_total = sum(i["price"] for i in items)
+        try:
+            financial_year = get_financial_year(date)
+            existing_inv = supabase.table("invoices").select("id").eq("financial_year", financial_year).execute()
+            invoice_num = len(existing_inv.data or []) + 1
+            invoice_number = f"{COMPANY_CODE}/{financial_year}/{invoice_num}"
+            grand_total = sum(i["price"] for i in items)
 
-        inv_res = supabase.table("invoices").insert({
-            "invoice_number": invoice_number, "ref_number": invoice_number,
-            "invoice_date": date, "financial_year": financial_year,
-            "client_id": CLIENT["id"], "client_name": CLIENT["party_name"],
-            "client_address": CLIENT["address"], "client_gstin": CLIENT["gstin"],
-            "client_state_name": CLIENT["state_name"], "client_state_code": CLIENT["state_code"],
-            "total_quantity": len(items), "grand_total": grand_total,
-            "amount_in_words": number_to_words(int(grand_total)) + " Rupees Only",
-            "declaration_text": DECLARATION, "status": "draft",
-        }).execute()
+            log.info(f"Creating invoice {invoice_number} for {date} — {len(items)} items")
 
-        invoice_id = inv_res.data[0]["id"]
-        supabase.table("invoice_items").insert([{
-            "invoice_id": invoice_id, "row_index": idx,
-            "barcode": item["barcode"],
-            "description": f"{item['description']} - {item['colour']} - {item['size']}",
-            "hsn_code": "640319", "quantity": 1, "unit": "Pair",
-            "rate": item["price"], "amount": item["price"],
-        } for idx, item in enumerate(items)]).execute()
+            inv_res = supabase.table("invoices").insert({
+                "invoice_number": invoice_number, "ref_number": invoice_number,
+                "invoice_date": date, "financial_year": financial_year,
+                "client_id": CLIENT["id"], "client_name": CLIENT["party_name"],
+                "client_address": CLIENT["address"], "client_gstin": CLIENT["gstin"],
+                "client_state_name": CLIENT["state_name"], "client_state_code": CLIENT["state_code"],
+                "total_quantity": len(items), "grand_total": grand_total,
+                "amount_in_words": number_to_words(int(grand_total)) + " Rupees Only",
+                "declaration_text": DECLARATION, "status": "draft",
+            }).execute()
 
-        log.info(f"✅ Invoice {invoice_number} — {len(items)} items, ₹{grand_total:,.0f}")
-        invoices_created += 1
+            invoice_id = inv_res.data[0]["id"]
+            log.info(f"Invoice ID: {invoice_id}")
+
+            supabase.table("invoice_items").insert([{
+                "invoice_id": invoice_id, "row_index": idx,
+                "barcode": item["barcode"],
+                "description": f"{item['description']} - {item['colour']} - {item['size']}",
+                "hsn_code": "640319", "quantity": 1, "unit": "Pair",
+                "rate": item["price"], "amount": item["price"],
+            } for idx, item in enumerate(items)]).execute()
+
+            log.info(f"✅ Invoice {invoice_number} — {len(items)} items, Rs.{grand_total:,}")
+            invoices_created += 1
+
+        except Exception as e:
+            log.error(f"Invoice creation failed for {date}: {e}", exc_info=True)
 
     log.info(f"── Complete: {len(new_rows)} sales + {invoices_created} invoices. Batch: {import_batch_id} ──")
 

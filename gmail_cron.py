@@ -45,7 +45,6 @@ SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
 SENDER_FILTER    = "consignment@crepdogcrew.com"
 SUBJECT_FILTER   = "Consignment Sales Report"
 GST_MARGIN       = 500          # fixed margin per item for GST calc
-SLEEP_HOURS      = 24           # how often to run
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -268,14 +267,11 @@ def run_import():
     log.info(f"── Import complete. Batch: {import_batch_id} ──────────")
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info(f"Gmail cron starting — will run every {SLEEP_HOURS}h")
-    while True:
-        try:
-            run_import()
-        except Exception as e:
-            log.error(f"Unhandled error in run_import: {e}", exc_info=True)
-        log.info(f"Sleeping {SLEEP_HOURS}h until next run...")
-        time.sleep(SLEEP_HOURS * 3600)
+    try:
+        run_import()
+    except Exception as e:
+        log.error(f"Unhandled error: {e}", exc_info=True)
+        raise

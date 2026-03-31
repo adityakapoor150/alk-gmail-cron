@@ -127,7 +127,7 @@ def parse_sales_table(html):
             "description": cv("description"),
             "colour":      cv("colour"),
             "size":        cv("size"),
-            "price":       parse_price(cv("price")),
+            "price":       int(parse_price(cv("price"))),
             "sale_date":   parse_date(cv("date")),
         })
     return rows
@@ -229,8 +229,8 @@ def run_import():
         "barcode": r["barcode"], "description": r["description"],
         "colour": r["colour"], "size": r["size"],
         "sale_amount": r["price"], "margin_taxable": GST_MARGIN,
-        "purchase_amount": r["price"] - GST_MARGIN,
-        "gst_amount": round(GST_MARGIN * 0.18, 2),
+        "purchase_amount": int(r["price"]) - GST_MARGIN,
+        "gst_amount": int(round(GST_MARGIN * 0.18)),
         "month": datetime.strptime(r["sale_date"], "%Y-%m-%d").month,
         "year": datetime.strptime(r["sale_date"], "%Y-%m-%d").year,
         "status": "draft", "sale_date": r["sale_date"],

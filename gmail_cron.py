@@ -1,26 +1,20 @@
 """
-gmail_cron.py — runs 24/7 on Render (free background worker)
+gmail_cron.py — runs daily via GitHub Actions
 
-What it does every 24 hours:
+What it does:
 1. Connects to alkresellshoes21@gmail.com via IMAP
-2. Finds unread emails from consignment@crepdogcrew.com with subject "Consignment Sales Report"
+2. Finds unread emails from consignment@crepdogcrew.com - "Consignment Sales Report"
 3. Parses the HTML table (Date, Style Name, Color, Size, Barcode, PV/Cost Price)
 4. Deduplicates against existing barcodes in Supabase
-5. Writes new rows to sales + payment_trackers + gsts tables
-6. Marks emails as read so they are never re-imported
-
-Env vars required (set in Render dashboard):
-  GMAIL_ADDRESS   — alkresellshoes21@gmail.com
-  GMAIL_APP_PASSWORD — 16-char app password from Google Account settings
-  SUPABASE_URL    — your Supabase project URL
-  SUPABASE_KEY    — your Supabase service role key
+5. Writes to: sales + payment_trackers + gsts
+6. Generates invoices grouped by date (client: House of CDC Fashion Private Limited - Delhi)
+7. Marks emails as read
 """
 
 import imaplib
 import email
 import re
 import os
-import time
 import logging
 from datetime import datetime
 from email.header import decode_header
@@ -28,29 +22,41 @@ from email.header import decode_header
 from bs4 import BeautifulSoup
 from supabase import create_client
 
-# ── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
-# ── Config from env vars ─────────────────────────────────────────────────────
-GMAIL_ADDRESS    = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASS   = os.environ["GMAIL_APP_PASSWORD"]
-SUPABASE_URL     = os.environ["SUPABASE_URL"]
-SUPABASE_KEY     = os.environ["SUPABASE_KEY"]
+GMAIL_ADDRESS  = os.environ["GMAIL_ADDRESS"]
+GMAIL_APP_PASS = os.environ["GMAIL_APP_PASSWORD"]
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
+SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 
-SENDER_FILTER    = "consignment@crepdogcrew.com"
-SUBJECT_FILTER   = "Consignment Sales Report"
-GST_MARGIN       = 500          # fixed margin per item for GST calc
+SENDER_FILTER  = "consignment@crepdogcrew.com"
+SUBJECT_FILTER = "Consignment Sales Report"
+GST_MARGIN     = 500
+
+CLIENT = {
+    "id":         "fd5245f2-252d-462d-b32c-a2164d4e3028",
+    "party_name": "House of CDC Fashion Private Limited - Delhi",
+    "address":    "Ground Floor, Plot No. 1, Khasra No. 261, Westend Marg Garden of Five Sense Road, Saidulajaib, New Delhi-110074",
+    "gstin":      "07AAGCH5076E1ZL",
+    "state_name": "Delhi",
+    "state_code": "07",
+}
+
+COMPANY_CODE = "ALK"
+
+DECLARATION = (
+    "1) The goods described in this invoice are pre-owned / second-hand goods supplied under the "
+    "GST Margin Scheme in accordance with applicable provisions of the GST law.\n\n"
+    "2) The invoice value represents the final and agreed transaction value between the parties "
+    "under the Margin Scheme. Payment against this invoice shall be made in full as per the agreed "
+    "terms and timelines.\n\n"
+    "3) All particulars stated herein are true and correct to the best of our knowledge and belief "
+    "at the time of issuance."
+)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def parse_date(raw: str) -> str:
-    """Convert DD/MM/YYYY → YYYY-MM-DD. Falls back to today."""
+def parse_date(raw):
     raw = (raw or "").strip()
     m = re.match(r"^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$", raw)
     if m:
@@ -61,8 +67,7 @@ def parse_date(raw: str) -> str:
     return datetime.today().strftime("%Y-%m-%d")
 
 
-def parse_price(raw: str) -> float:
-    """Strip ₹, commas, spaces and return float."""
+def parse_price(raw):
     cleaned = re.sub(r"[^\d.]", "", raw or "")
     try:
         return float(cleaned)
@@ -70,12 +75,10 @@ def parse_price(raw: str) -> float:
         return 0.0
 
 
-def get_html_body(msg) -> str | None:
-    """Walk a MIME message and return the first text/html part."""
+def get_html_body(msg):
     if msg.is_multipart():
         for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/html":
+            if part.get_content_type() == "text/html":
                 charset = part.get_content_charset() or "utf-8"
                 return part.get_payload(decode=True).decode(charset, errors="replace")
     else:
@@ -85,54 +88,40 @@ def get_html_body(msg) -> str | None:
     return None
 
 
-def parse_sales_table(html: str) -> list[dict]:
-    """Extract rows from the Consignment Sales Report HTML table."""
+def parse_sales_table(html):
     soup = BeautifulSoup(html, "html.parser")
     rows = []
-
-    # Find the table that contains "Barcode"
     target_table = None
     for table in soup.find_all("table"):
         if "Barcode" in table.get_text():
             target_table = table
             break
-
     if not target_table:
-        log.warning("No sales table found in email body")
+        log.warning("No sales table found in email")
         return rows
-
     all_rows = target_table.find_all("tr")
     if len(all_rows) < 2:
         return rows
-
-    # Map column names → indices from header row
-    header_cells = all_rows[0].find_all(["th", "td"])
-    headers = [c.get_text(strip=True).lower() for c in header_cells]
-
+    headers = [c.get_text(strip=True).lower() for c in all_rows[0].find_all(["th", "td"])]
     col = {}
     for i, h in enumerate(headers):
-        if "date" in h:                              col["date"] = i
-        elif "style" in h or "name" in h:            col["description"] = i
-        elif "color" in h or "colour" in h:          col["colour"] = i
-        elif "size" in h:                             col["size"] = i
-        elif "barcode" in h:                          col["barcode"] = i
+        if "date" in h:                                 col["date"] = i
+        elif "style" in h or "name" in h:               col["description"] = i
+        elif "color" in h or "colour" in h:             col["colour"] = i
+        elif "size" in h:                                col["size"] = i
+        elif "barcode" in h:                             col["barcode"] = i
         elif "pv" in h or "cost" in h or "price" in h: col["price"] = i
-
-    log.info(f"Column mapping: {col}")
-
+    log.info(f"Column map: {col}")
     for row in all_rows[1:]:
         cells = row.find_all("td")
         if len(cells) < 3:
             continue
-
-        def cv(key):
+        def cv(key, cells=cells):
             idx = col.get(key)
             return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else ""
-
         barcode = cv("barcode").strip()
         if not barcode:
             continue
-
         rows.append({
             "barcode":     barcode,
             "description": cv("description"),
@@ -141,16 +130,33 @@ def parse_sales_table(html: str) -> list[dict]:
             "price":       parse_price(cv("price")),
             "sale_date":   parse_date(cv("date")),
         })
-
     return rows
 
 
-# ── Core job ─────────────────────────────────────────────────────────────────
+def get_financial_year(date_str):
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    if d.month >= 4:
+        return f"{str(d.year)[2:]}-{str(d.year + 1)[2:]}"
+    return f"{str(d.year - 1)[2:]}-{str(d.year)[2:]}"
+
+
+def number_to_words(num):
+    ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"]
+    teens = ["Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+    tens_w = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+    if num == 0: return "Zero"
+    if num < 10: return ones[num]
+    if num < 20: return teens[num - 10]
+    if num < 100: return tens_w[num // 10] + (" " + ones[num % 10] if num % 10 else "")
+    if num < 1000: return ones[num // 100] + " Hundred" + (" and " + number_to_words(num % 100) if num % 100 else "")
+    if num < 100000: return number_to_words(num // 1000) + " Thousand" + (" " + number_to_words(num % 1000) if num % 1000 else "")
+    if num < 10000000: return number_to_words(num // 100000) + " Lakh" + (" " + number_to_words(num % 100000) if num % 100000 else "")
+    return number_to_words(num // 10000000) + " Crore" + (" " + number_to_words(num % 10000000) if num % 10000000 else "")
+
 
 def run_import():
-    log.info("── Starting Gmail import job ──────────────────────────")
+    log.info("── Starting Gmail import job ──────────────────────────────────")
 
-    # 1. Connect to Gmail via IMAP
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
@@ -160,9 +166,7 @@ def run_import():
         log.error(f"Gmail connection failed: {e}")
         return
 
-    # 2. Search for unread emails from the sender
-    search_criteria = f'(UNSEEN FROM "{SENDER_FILTER}" SUBJECT "{SUBJECT_FILTER}")'
-    _, msg_ids_raw = mail.search(None, search_criteria)
+    _, msg_ids_raw = mail.search(None, f'(UNSEEN FROM "{SENDER_FILTER}" SUBJECT "{SUBJECT_FILTER}")')
     msg_ids = msg_ids_raw[0].split()
 
     if not msg_ids:
@@ -172,28 +176,20 @@ def run_import():
 
     log.info(f"Found {len(msg_ids)} unread email(s)")
 
-    # 3. Parse each email
     all_rows = []
     for mid in msg_ids:
         _, data = mail.fetch(mid, "(RFC822)")
-        raw = data[0][1]
-        msg = email.message_from_bytes(raw)
-
+        msg = email.message_from_bytes(data[0][1])
         subject = decode_header(msg["Subject"])[0][0]
         if isinstance(subject, bytes):
             subject = subject.decode(errors="replace")
-        log.info(f"Parsing email: {subject}")
-
+        log.info(f"Parsing: {subject}")
         html = get_html_body(msg)
         if not html:
-            log.warning(f"No HTML body in email {mid}")
             continue
-
         parsed = parse_sales_table(html)
         log.info(f"  → {len(parsed)} rows parsed")
         all_rows.extend(parsed)
-
-        # Mark as read
         mail.store(mid, "+FLAGS", "\\Seen")
 
     mail.logout()
@@ -202,72 +198,83 @@ def run_import():
         log.info("No rows parsed from any email")
         return
 
-    # 4. Connect to Supabase and deduplicate
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     existing = supabase.table("sales").select("barcode").execute()
     existing_barcodes = {r["barcode"] for r in (existing.data or [])}
-
     new_rows = [r for r in all_rows if r["barcode"] not in existing_barcodes]
-    log.info(f"Total parsed: {len(all_rows)} | New (not in DB): {len(new_rows)}")
+    log.info(f"Total: {len(all_rows)} | New: {len(new_rows)} | Skipped dupes: {len(all_rows)-len(new_rows)}")
 
     if not new_rows:
-        log.info("All barcodes already in DB — nothing to import")
+        log.info("All barcodes already imported — nothing to do")
         return
 
-    # 5. Build records for all three tables
     import_batch_id = f"GMAIL_{int(datetime.now().timestamp())}"
 
-    sales_records = [{
+    supabase.table("sales").insert([{
         "import_batch_id": import_batch_id,
-        "barcode":         r["barcode"],
-        "description":     r["description"],
-        "colour":          r["colour"],
-        "size":            r["size"],
-        "price":           r["price"],
-        "sale_date":       r["sale_date"],
-    } for r in new_rows]
+        "barcode": r["barcode"], "description": r["description"],
+        "colour": r["colour"], "size": r["size"],
+        "price": r["price"], "sale_date": r["sale_date"],
+    } for r in new_rows]).execute()
+    log.info(f"✅ {len(new_rows)} rows → sales")
 
-    payment_records = [{
-        "barcode":         r["barcode"],
-        "sale_amount":     r["price"],
-        "received_amount": 0,
-        "balance":         r["price"],
-        "status":          "unpaid",
-        "sale_date":       r["sale_date"],
-    } for r in new_rows]
+    supabase.table("payment_trackers").insert([{
+        "barcode": r["barcode"], "sale_amount": r["price"],
+        "received_amount": 0, "balance": r["price"],
+        "status": "unpaid", "sale_date": r["sale_date"],
+    } for r in new_rows]).execute()
+    log.info(f"✅ {len(new_rows)} rows → payment_trackers")
 
-    gst_records = []
+    supabase.table("gsts").insert([{
+        "barcode": r["barcode"], "description": r["description"],
+        "colour": r["colour"], "size": r["size"],
+        "sale_amount": r["price"], "margin_taxable": GST_MARGIN,
+        "purchase_amount": r["price"] - GST_MARGIN,
+        "gst_amount": round(GST_MARGIN * 0.18, 2),
+        "month": datetime.strptime(r["sale_date"], "%Y-%m-%d").month,
+        "year": datetime.strptime(r["sale_date"], "%Y-%m-%d").year,
+        "status": "draft", "sale_date": r["sale_date"],
+    } for r in new_rows]).execute()
+    log.info(f"✅ {len(new_rows)} rows → gsts")
+
+    # Generate invoices grouped by date
+    grouped = {}
     for r in new_rows:
-        d = datetime.strptime(r["sale_date"], "%Y-%m-%d")
-        gst_records.append({
-            "barcode":         r["barcode"],
-            "description":     r["description"],
-            "colour":          r["colour"],
-            "size":            r["size"],
-            "sale_amount":     r["price"],
-            "margin_taxable":  GST_MARGIN,
-            "purchase_amount": r["price"] - GST_MARGIN,
-            "gst_amount":      round(GST_MARGIN * 0.18, 2),
-            "month":           d.month,
-            "year":            d.year,
-            "status":          "draft",
-            "sale_date":       r["sale_date"],
-        })
+        grouped.setdefault(r["sale_date"], []).append(r)
 
-    # 6. Write to Supabase
-    supabase.table("sales").insert(sales_records).execute()
-    log.info(f"✅ Inserted {len(sales_records)} rows into sales")
+    invoices_created = 0
+    for date, items in sorted(grouped.items()):
+        financial_year = get_financial_year(date)
+        existing_inv = supabase.table("invoices").select("id").eq("financial_year", financial_year).execute()
+        invoice_num = len(existing_inv.data or []) + 1
+        invoice_number = f"{COMPANY_CODE}/{financial_year}/{invoice_num}"
+        grand_total = sum(i["price"] for i in items)
 
-    supabase.table("payment_trackers").insert(payment_records).execute()
-    log.info(f"✅ Inserted {len(payment_records)} rows into payment_trackers")
+        inv_res = supabase.table("invoices").insert({
+            "invoice_number": invoice_number, "ref_number": invoice_number,
+            "invoice_date": date, "financial_year": financial_year,
+            "client_id": CLIENT["id"], "client_name": CLIENT["party_name"],
+            "client_address": CLIENT["address"], "client_gstin": CLIENT["gstin"],
+            "client_state_name": CLIENT["state_name"], "client_state_code": CLIENT["state_code"],
+            "total_quantity": len(items), "grand_total": grand_total,
+            "amount_in_words": number_to_words(int(grand_total)) + " Rupees Only",
+            "declaration_text": DECLARATION, "status": "draft",
+        }).execute()
 
-    supabase.table("gsts").insert(gst_records).execute()
-    log.info(f"✅ Inserted {len(gst_records)} rows into gsts")
+        invoice_id = inv_res.data[0]["id"]
+        supabase.table("invoice_items").insert([{
+            "invoice_id": invoice_id, "row_index": idx,
+            "barcode": item["barcode"],
+            "description": f"{item['description']} - {item['colour']} - {item['size']}",
+            "hsn_code": "640319", "quantity": 1, "unit": "Pair",
+            "rate": item["price"], "amount": item["price"],
+        } for idx, item in enumerate(items)]).execute()
 
-    log.info(f"── Import complete. Batch: {import_batch_id} ──────────")
+        log.info(f"✅ Invoice {invoice_number} — {len(items)} items, ₹{grand_total:,.0f}")
+        invoices_created += 1
 
+    log.info(f"── Complete: {len(new_rows)} sales + {invoices_created} invoices. Batch: {import_batch_id} ──")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:

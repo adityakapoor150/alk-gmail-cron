@@ -2,8 +2,8 @@ name: Gmail Sales Import
 
 on:
   schedule:
-    - cron: '30 0 * * *'   # runs daily at 6:00am IST (00:30 UTC)
-  workflow_dispatch:         # also allows manual trigger from GitHub UI
+    - cron: '30 0 * * *'
+  workflow_dispatch:
 
 jobs:
   import:

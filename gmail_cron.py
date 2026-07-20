@@ -265,7 +265,8 @@ def run_import():
         "received_amount": 0, "balance": r["price"],
         "status": "unpaid", "sale_date": r["sale_date"],
     } for r in new_rows]).execute()
-    log.info(f"✅ {len(new_rows)} rows → payment_trackers")html = get_html_body(msg)
+    log.info(f"✅ {len(new_rows)} rows → payment_trackers")
+    html = get_html_body(msg)
         if not html:
             continue
         parsed = parse_sales_table(html)

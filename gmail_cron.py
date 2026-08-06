@@ -166,7 +166,7 @@ def run_import():
         log.error(f"Gmail connection failed: {e}")
         return
 
-    # Search emails from last 2 days — barcode deduplication handles skipping already-imported ones
+    # Search emails from last 7 days — barcode deduplication handles skipping already-imported ones
     import time as _time
     since_imap = datetime.fromtimestamp(_time.time() - 7 * 86400).strftime("%d-%b-%Y")
     _, msg_ids_raw = mail.search(None, f'(FROM "{SENDER_FILTER}" SUBJECT "{SUBJECT_FILTER}" SINCE {since_imap})')
@@ -257,48 +257,8 @@ def run_import():
         log.info(f"✅ {len(new_rows)} rows → sales (after fallback)")
 
     if not new_rows:
-        log.info("Nothing made it into sales — skipping payment_trackers")
+        log.info("Nothing made it into sales — skipping payment_trackers/gsts/invoices")
         return
-
-    supabase.table("payment_trackers").insert([{
-        "barcode": r["barcode"], "sale_amount": r["price"],
-        "received_amount": 0, "balance": r["price"],
-        "status": "unpaid", "sale_date": r["sale_date"],
-    } for r in new_rows]).execute()
-    log.info(f"✅ {len(new_rows)} rows → payment_trackers")
-    html = get_html_body(msg)
-        if not html:
-            continue
-        parsed = parse_sales_table(html)
-        log.info(f"  → {len(parsed)} rows parsed")
-        all_rows.extend(parsed)
-        # not marking as read — deduplication by barcode handles re-runs safely
-
-    mail.logout()
-
-    if not all_rows:
-        log.info("No rows parsed from any email")
-        return
-
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    existing = supabase.table("sales").select("barcode").execute()
-    existing_barcodes = {r["barcode"] for r in (existing.data or [])}
-    new_rows = [r for r in all_rows if r["barcode"] not in existing_barcodes]
-    log.info(f"Total: {len(all_rows)} | New: {len(new_rows)} | Skipped dupes: {len(all_rows)-len(new_rows)}")
-
-    if not new_rows:
-        log.info("All barcodes already imported — nothing to do")
-        return
-
-    import_batch_id = f"GMAIL_{int(datetime.now().timestamp())}"
-
-    supabase.table("sales").insert([{
-        "import_batch_id": import_batch_id,
-        "barcode": r["barcode"], "description": r["description"],
-        "colour": r["colour"], "size": r["size"],
-        "price": r["price"], "sale_date": r["sale_date"],
-    } for r in new_rows]).execute()
-    log.info(f"✅ {len(new_rows)} rows → sales")
 
     supabase.table("payment_trackers").insert([{
         "barcode": r["barcode"], "sale_amount": r["price"],
